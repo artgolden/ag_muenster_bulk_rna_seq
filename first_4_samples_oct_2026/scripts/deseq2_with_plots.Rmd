@@ -184,6 +184,11 @@ ph <- pheatmap(dist_mat, cluster_rows = hc, cluster_cols = hc,
 grid::grid.newpage(); grid::grid.draw(ph$gtable)
 pheatmap(dist_mat, cluster_rows = hc, cluster_cols = hc, annotation_col = annotation,
          annotation_row = annotation, filename = file.path(out, "sample_distances.pdf"))
+```
+
+## Most variable genes and good p_adj DEGs
+
+```{r most-variable, fig.width=10, fig.height=8, fig.keep='all'}
 v <- apply(assay(rld), 1, var)
 top_var <- head(names(sort(v[v > 0], decreasing = TRUE)), 30)
 if (length(top_var) >= 2) {
@@ -247,6 +252,77 @@ if (length(top_var) >= 2) {
 
 # This must be outside the if block, inside the R chunk.
 heatmap_display
+```
+
+
+```{r top-DEG-heatmap, fig.width=10, fig.height=8}
+top_degs <- res_tbl %>%
+  dplyr::filter(!is.na(padj), padj < alpha) %>%
+  dplyr::arrange(padj) %>%
+  head(30)
+
+deg_heatmap_display <- NULL
+
+if (nrow(top_degs) > 0) {
+  deg_mat <- assay(rld)[top_degs$gene_id, , drop = FALSE]
+
+  # Gene-name labels in the same order as the matrix rows.
+  gene_labels <- trimws(as.character(top_degs$gene_name))
+  missing_name <- is.na(gene_labels) |
+    gene_labels %in% c("", "-", "NA")
+  gene_labels[missing_name] <- top_degs$gene_id[missing_name]
+
+  duplicate_name <- duplicated(gene_labels) |
+    duplicated(gene_labels, fromLast = TRUE)
+  gene_labels[duplicate_name] <- paste0(
+    gene_labels[duplicate_name], " [",
+    top_degs$gene_id[duplicate_name], "]"
+  )
+
+  deg_annotation <- coldata[
+    colnames(deg_mat), c("condition", "batch"), drop = FALSE
+  ]
+
+  deg_h <- pheatmap::pheatmap(
+    deg_mat,
+    scale = "row",
+    cluster_rows = nrow(deg_mat) > 1,
+    annotation_col = deg_annotation,
+    labels_row = gene_labels,
+    show_rownames = TRUE,
+    fontsize_row = 9,
+    fontsize_col = 9,
+    angle_col = "45",
+    main = paste0(
+      "Top ", nrow(deg_mat), " DE genes (FDR < ", alpha, ")\n",
+      "rlog expression, row z-scores"
+    ),
+    silent = TRUE
+  )
+
+  # Save PDF.
+  pdf(file.path(out, "top30_DEGs_heatmap.pdf"),
+      width = 10, height = 8)
+  grid::grid.newpage()
+  grid::grid.draw(deg_h$gtable)
+  invisible(dev.off())
+
+  # Save PNG for the knitted document.
+  deg_png <- file.path(out, "top30_DEGs_heatmap.png")
+  png(deg_png, width = 2000, height = 1600, res = 200)
+  grid::grid.newpage()
+  grid::grid.draw(deg_h$gtable)
+  invisible(dev.off())
+
+  deg_heatmap_display <- knitr::include_graphics(
+    normalizePath(deg_png)
+  )
+} else {
+  cat("No genes pass the adjusted P-value threshold; no DEG heatmap drawn.\n")
+}
+
+# Outside the if/else block so knitr renders the image.
+deg_heatmap_display
 ```
 
 ## MA, volcano and uncertainty
