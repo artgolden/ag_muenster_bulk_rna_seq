@@ -1,0 +1,11 @@
+*/.Rproj.user
+*/.Rhistory
+*/.RData
+*/.Ruserdata
+*/outs/*
+*/reports/*
+*/plots/*
+*.nb.html
+*.png
+*_files
+*_cache

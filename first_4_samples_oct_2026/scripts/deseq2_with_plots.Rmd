@@ -1,0 +1,332 @@
+---
+title: "Novogene bulk RNA-seq: dsRed versus control"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+knit: (function(inputFile, encoding) { script_dir <- dirname(normalizePath(inputFile)); out <- file.path(script_dir, "..", "outs"); dir.create(out, recursive = TRUE, showWarnings = FALSE); rmarkdown::render(inputFile, encoding = encoding, output_dir = out, knit_root_dir = script_dir) })
+---
+
+Save this file in `scripts/` and click **Knit** in RStudio. Input is
+`../data/gene_count.xls`; tables, PDFs, model objects and the HTML report go to
+`../outs`. Positive log2 fold change means higher expression in dsRed.
+
+Install dependencies once in that environment, outside knitting:
+
+```{r install, eval=FALSE}
+# Use an R-4.0-compatible CRAN library/snapshot for these packages.
+install.packages(c("readxl", "ggrepel",
+                   "rmarkdown", "knitr"))
+#BiocManager::install(version = "3.12", ask = FALSE)
+BiocManager::install(c("apeglm"), ask = FALSE, update = FALSE)
+```
+
+## Import and design
+
+Raw gene counts are used; FPKM and group averages are unsuitable inputs.
+Processing date is modeled as a batch, **not a biological pairing**. The
+additive model assumes a common condition effect across dates; four samples
+cannot support a batch-by-condition interaction. Only one residual degree of
+freedom remains. Set `adjust_batch <- FALSE` only if processing date is known
+not to represent a relevant batch, not because it yields more significant genes.
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 5)
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(ggrepel)
+  library(pheatmap)
+})
+set.seed(42)
+out <- "../outs"
+dir.create(out, recursive = TRUE, showWarnings = FALSE)
+alpha <- 0.05
+lfc_cut <- 1                     # Descriptive |log2FC| cutoff; not a threshold test
+adjust_batch <- TRUE
+save_plot <- function(p, name, height = 5) {
+  print(p)
+  ggsave(file.path(out, paste0(name, ".pdf")), p, width = 8, height = height)
+}
+meta <- tibble(
+  sample = c("srp_8_9_26", "dsRed_8_9_26", "srp_27_8_26", "dRed_27_8_26"),
+  condition = factor(c("control", "dsRed", "control", "dsRed"),
+                     levels = c("control", "dsRed")),
+  batch = factor(c("2026-09-08", "2026-09-08", "2026-08-27", "2026-08-27"))
+)
+
+# Detect real Excel files by their signature; Novogene often supplies TSV as .xls.
+path <- "../data/gene_count.xls"
+signature <- readBin(path, "raw", n = 8)
+excel <- (length(signature) >= 2 &&
+          identical(signature[1:2], as.raw(c(0x50, 0x4b)))) ||
+         identical(signature, as.raw(c(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1)))
+tab <- if (excel) {
+  reader <- if (identical(signature[1:2], as.raw(c(0x50, 0x4b))))
+    readxl::read_xlsx else readxl::read_xls
+  reader(path, col_types = "text", .name_repair = "minimal")
+} else {
+  readr::read_tsv(path, col_types = cols(.default = col_character()),
+                  na = c("", "NA"), quote = "", name_repair = "minimal")
+}
+stopifnot(!anyDuplicated(names(tab)),
+          all(c("gene_id", "gene_name", "gene_biotype", meta$sample) %in% names(tab)))
+ann <- tab %>% dplyr::select(-all_of(meta$sample))
+stopifnot(!anyNA(ann$gene_id), !any(ann$gene_id == ""), !anyDuplicated(ann$gene_id))
+cts <- tab %>% dplyr::select(all_of(meta$sample)) %>%
+  mutate(across(everything(), as.numeric)) %>% as.matrix()
+stopifnot(all(is.finite(cts)), all(cts >= 0), all(cts == floor(cts)),
+          all(cts <= .Machine$integer.max), all(colSums(cts) > 0))
+storage.mode(cts) <- "integer"  # Validation above prevents silent rounding.
+rownames(cts) <- ann$gene_id
+coldata <- as.data.frame(meta) %>% column_to_rownames("sample")
+stopifnot(identical(colnames(cts), rownames(coldata)))
+design_formula <- if (adjust_batch) ~ batch + condition else ~ condition
+mm <- model.matrix(design_formula, coldata)
+stopifnot(qr(mm)$rank == ncol(mm), nrow(mm) > ncol(mm))
+knitr::kable(meta)
+cat("Residual degrees of freedom:", nrow(mm) - ncol(mm), "\n")
+write_csv(meta, file.path(out, "sample_metadata.csv"))
+```
+
+## Count-level QC
+
+Assigned gene counts are not total sequenced reads. rRNA and dominance of a
+few genes can reveal composition problems; assess these against the intended
+library preparation. All biotypes are retained in the model.
+
+```{r count-qc}
+rrna <- grepl("rRNA", ann$gene_biotype, ignore.case = TRUE)
+rrna[is.na(rrna)] <- FALSE
+qc <- meta %>% mutate(
+  assigned_counts = colSums(cts),
+  detected_genes = colSums(cts > 0),
+  rRNA_percent = 100 * colSums(cts[rrna, , drop = FALSE]) / colSums(cts),
+  top10_percent = 100 * apply(cts, 2, function(x) sum(head(sort(x, decreasing = TRUE), 10))) /
+                  colSums(cts)
+)
+knitr::kable(qc, digits = 2)
+write_csv(qc, file.path(out, "sample_QC.csv"))
+save_plot(qc %>% pivot_longer(c(assigned_counts, detected_genes, rRNA_percent, top10_percent),
+                             names_to = "metric", values_to = "value") %>%
+  ggplot(aes(sample, value, fill = condition)) + geom_col() +
+  facet_wrap(~ metric, scales = "free_y") + theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)), "count_QC", 7)
+```
+
+## Fit and differential expression
+
+Keep genes with at least 10 counts in at least two samples, including genes
+expressed only in one condition. DESeq2 additionally performs independent
+filtering. Tests use unshrunken coefficients; apeglm shrinkage is for displaying
+and ranking effect sizes. Missing adjusted P values remain missing.
+
+```{r fit, message=FALSE}
+keep <- rowSums(cts >= 10) >= 2
+stopifnot(sum(keep) >= 2)
+cat("Retained", sum(keep), "of", nrow(cts), "genes.\n")
+dds <- DESeqDataSetFromMatrix(cts[keep, , drop = FALSE], coldata, design_formula)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("condition", "dsRed", "control"), alpha = alpha)
+shr <- lfcShrink(dds, coef = "condition_dsRed_vs_control", res = res, type = "apeglm")
+res_tbl <- as.data.frame(res) %>% rownames_to_column("gene_id") %>%
+  mutate(log2FC_shrunken = shr$log2FoldChange,
+         label = gene_id) %>% left_join(ann, by = "gene_id") %>%
+  mutate(label = if_else(is.na(gene_name) | gene_name %in% c("", "-"),
+                         gene_id, paste0(gene_name, " [", gene_id, "]")),
+         DEG = !is.na(padj) & padj < alpha,
+         large_effect_DEG = DEG & abs(log2FC_shrunken) >= lfc_cut) %>%
+  arrange(padj, desc(abs(log2FC_shrunken)))
+write_csv(res_tbl, file.path(out, "DESeq2_all_tested_genes.csv"))
+write_csv(dplyr::filter(res_tbl, DEG), file.path(out, "DESeq2_FDR05.csv"))
+write_csv(dplyr::filter(res_tbl, large_effect_DEG), file.path(out, "DESeq2_FDR05_LFC1.csv"))
+norm <- counts(dds, normalized = TRUE)
+write_csv(as.data.frame(norm) %>% rownames_to_column("gene_id"),
+          file.path(out, "normalized_counts.csv"))
+qc$size_factor <- sizeFactors(dds)
+write_csv(qc, file.path(out, "sample_QC.csv"))
+summary(res)
+```
+
+## Dispersion, PCA and sample distances
+
+Dispersion describes count variability after accounting for the model.
+Inspect fit quality and high-dispersion genes. PCA and distances use rlog
+counts; `blind = FALSE` uses the fitted dispersion trend and does **not** remove
+batch effects. Look for condition clustering, date clustering and inconsistent
+replicates. PCA alone is not grounds to remove a sample.
+
+```{r sample-plots, fig.width=10, fig.height=8, fig.keep='all'}
+plotDispEsts(dds)
+pdf(file.path(out, "dispersion.pdf"), width = 7, height = 5)
+plotDispEsts(dds)
+dev.off()
+rld <- rlog(dds, blind = FALSE)
+pc <- plotPCA(rld, intgroup = c("condition", "batch"), returnData = TRUE,
+              ntop = min(500, nrow(dds)))
+pv <- round(100 * attr(pc, "percentVar"), 1)
+save_plot(ggplot(pc, aes(PC1, PC2, color = condition, shape = batch, label = name)) +
+  geom_point(size = 4) + geom_text_repel(seed = 42) + theme_bw() +
+  labs(x = paste0("PC1: ", pv[1], "%"), y = paste0("PC2: ", pv[2], "%")), "PCA")
+
+annotation <- coldata[, c("condition", "batch"), drop = FALSE]
+dist_mat <- as.matrix(dist(t(assay(rld))))
+hc <- hclust(as.dist(dist_mat))
+ph <- pheatmap(dist_mat, cluster_rows = hc, cluster_cols = hc,
+              annotation_col = annotation, annotation_row = annotation,
+              main = "rlog sample distances", silent = TRUE)
+grid::grid.newpage(); grid::grid.draw(ph$gtable)
+pheatmap(dist_mat, cluster_rows = hc, cluster_cols = hc, annotation_col = annotation,
+         annotation_row = annotation, filename = file.path(out, "sample_distances.pdf"))
+v <- apply(assay(rld), 1, var)
+top_var <- head(names(sort(v[v > 0], decreasing = TRUE)), 30)
+if (length(top_var) >= 2) {
+  heat_mat <- assay(rld)[top_var, , drop = FALSE]
+
+  # Match gene names to matrix rows by gene ID.
+  gene_labels <- as.character(ann$gene_name[
+    match(rownames(heat_mat), as.character(ann$gene_id))
+  ])
+  gene_labels <- trimws(gene_labels)
+
+  # Fall back to gene IDs when names are missing.
+  missing_name <- is.na(gene_labels) |
+    gene_labels %in% c("", "-", "NA")
+  gene_labels[missing_name] <- rownames(heat_mat)[missing_name]
+
+  # Distinguish genes that share a name.
+  duplicate_name <- duplicated(gene_labels) |
+    duplicated(gene_labels, fromLast = TRUE)
+  gene_labels[duplicate_name] <- paste0(
+    gene_labels[duplicate_name], " [",
+    rownames(heat_mat)[duplicate_name], "]"
+  )
+
+  h <- pheatmap(
+    heat_mat,
+    scale = "row",
+    annotation_col = annotation,
+    labels_row = gene_labels,
+    show_rownames = TRUE,
+    fontsize_row = 9,
+    fontsize_col = 9,
+    angle_col = "45",
+    main = "Most variable genes (row z-scores)",
+    silent = TRUE
+  )
+
+
+
+# Save PDF.
+  pdf(file.path(out, "variable_genes_heatmap.pdf"),
+      width = 10, height = 8)
+  grid::grid.newpage()
+  grid::grid.draw(h$gtable)
+  invisible(dev.off())
+
+  # Save PNG for embedding in the knitted document.
+  heatmap_png <- file.path(out, "variable_genes_heatmap.png")
+  png(heatmap_png, width = 2000, height = 1600, res = 200)
+  grid::grid.newpage()
+  grid::grid.draw(h$gtable)
+  invisible(dev.off())
+
+  heatmap_display <- knitr::include_graphics(
+    normalizePath(heatmap_png)
+  )
+} else {
+  heatmap_display <- NULL
+  cat("Too few variable genes to draw a heatmap.\n")
+}
+
+# This must be outside the if block, inside the R chunk.
+heatmap_display
+```
+
+## MA, volcano and uncertainty
+
+Volcano labels show the ten lowest-FDR significant genes, or the ten lowest-FDR
+tested genes when none is significant. Dashed fold-change lines are descriptive;
+the P values test a zero condition effect, not the dashed thresholds.
+
+```{r DEG-plots}
+plotMA(shr, alpha = alpha, main = "MA: shrunken log2 fold changes")
+pdf(file.path(out, "MA.pdf"), width = 7, height = 5)
+plotMA(shr, alpha = alpha)
+dev.off()
+tested <- res_tbl %>% dplyr::filter(!is.na(padj), is.finite(log2FC_shrunken)) %>%
+  mutate(y = -log10(pmax(padj, .Machine$double.xmin)))
+labels <- tested %>% dplyr::filter(DEG) %>% head(10)
+if (nrow(labels) == 0) labels <- head(tested, 10)
+save_plot(ggplot(tested, aes(log2FC_shrunken, y, color = DEG)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = 2) +
+  geom_hline(yintercept = -log10(alpha), linetype = 2) +
+  geom_text_repel(data = labels, aes(label = label), seed = 42, max.overlaps = Inf,
+                  size = 3) + scale_color_manual(values = c("grey65", "firebrick")) +
+  theme_bw() + labs(x = "Shrunken log2FC: dsRed / control", y = "-log10(adjusted P)",
+                    color = "FDR < 0.05"), "volcano", 6)
+save_plot(ggplot(res_tbl %>% dplyr::filter(baseMean > 0, is.finite(lfcSE)),
+                 aes(baseMean, lfcSE, color = DEG)) + geom_point(alpha = 0.3) +
+  scale_x_log10() + theme_bw() +
+  labs(x = "Mean normalized count", y = "Unshrunken log2FC standard error"), "LFC_uncertainty")
+save_plot(ggplot(res_tbl %>% dplyr::filter(!is.na(pvalue)), aes(pvalue)) +
+  geom_histogram(bins = 40) + theme_bw(), "pvalue_histogram")
+```
+
+## Inspect individual samples
+
+Top-gene points show normalized counts, not batch-adjusted expression. Compare
+the two dates and check whether a candidate effect is driven by one sample.
+Cook's distances flag influential observations; with two samples per condition,
+default DESeq2 outlier filtering/replacement has important limitations. Do not
+automatically exclude samples or genes based on this plot.
+
+```{r individual-plots}
+if (nrow(labels) > 0) {
+  top_counts <- as.data.frame(norm[head(labels$gene_id, 6), , drop = FALSE]) %>%
+    rownames_to_column("gene_id") %>% pivot_longer(-gene_id, names_to = "sample",
+                                                  values_to = "count") %>%
+    left_join(meta, by = "sample") %>%
+    left_join(res_tbl %>% dplyr::select(gene_id, label), by = "gene_id")
+  save_plot(ggplot(top_counts, aes(condition, count + 0.5, color = batch)) +
+    geom_point(position = position_jitter(width = 0.1, height = 0, seed = 42), size = 3) +
+    scale_y_log10() + facet_wrap(~ label, scales = "free_y") + theme_bw() +
+    labs(y = "Normalized count + 0.5"), "top_gene_counts", 7)
+}
+cooks <- as.data.frame(assays(dds)[["cooks"]]) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "cooks")
+save_plot(ggplot(cooks %>% dplyr::filter(is.finite(cooks)),
+                 aes(sample, log10(cooks + 1))) + geom_boxplot(outlier.shape = NA) +
+  theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = "log10(Cook's distance + 1)"), "Cooks_distances")
+saveRDS(list(dds = dds, rlog = rld, results = res_tbl, metadata = meta),
+        file.path(out, "DESeq2_analysis.rds"))
+writeLines(capture.output(sessionInfo()), file.path(out, "sessionInfo.txt"))
+```
+
+## Deciding whether to add biological replicates
+
+With **two independent biological samples per condition**, inference is
+preliminary. High dispersion, wide effect uncertainty, inconsistent top-gene
+counts, or strong batch structure support collecting more independent samples.
+An absence of significant genes does not establish an absence of a condition
+effect. Balance both conditions across new processing batches.
+
+Additional sequencing of existing libraries improves sampling precision but
+does not add biological replication. If counts are already high while dispersion
+and uncertainty remain high, more biological samples may help more than greater
+depth. Count totals and detected genes alone cannot establish sequencing
+saturation. Examine Novogene/FastQC/MultiQC metrics (mapping, duplication,
+rRNA, library complexity and RNA quality) before deciding on resequencing.
+
+These QC plots do not provide a reliable required sample size from four samples.
+Plan replication using a biologically meaningful effect size, target FDR/power,
+and conservative dispersion estimates from this pilot or a larger comparable
+dataset. Do not choose a model or exclude samples to increase the DEG count.
+
+Reference: [DESeq2 vignette](https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html).
+
+```{r session}
+sessionInfo()
+```
