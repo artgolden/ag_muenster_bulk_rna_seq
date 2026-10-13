@@ -1,5 +1,5 @@
 ---
-title: "Novogene bulk RNA-seq: dsRed versus control"
+title: "Novogene bulk RNA-seq: srp versus dsRed control"
 output:
   html_document:
     toc: true
@@ -9,15 +9,21 @@ knit: (function(inputFile, encoding) { script_dir <- dirname(normalizePath(input
 
 Save this file in `scripts/` and click **Knit** in RStudio. Input is
 `../data/gene_count.xls`; tables, PDFs, model objects and the HTML report go to
-`../outs`. Positive log2 fold change means higher expression in dsRed.
+`../outs`. Positive log2 fold change means higher expression in srp
+(condition) relative to dsRed/dRed (control). `srp_8_9_26` and
+`srp_27_8_26` are condition samples; `dsRed_8_9_26` and `dRed_27_8_26`
+are controls.
+
+This script uses your working R 4.3.1 environment with BiocManager already
+installed for the appropriate Bioconductor version.
 
 Install dependencies once in that environment, outside knitting:
 
 ```{r install, eval=FALSE}
-# Use an R-4.0-compatible CRAN library/snapshot for these packages.
+# Optional missing dependencies only, using your existing R 4.3.1 environment.
 install.packages(c("readxl", "ggrepel",
-                   "rmarkdown", "knitr"))
-#BiocManager::install(version = "3.12", ask = FALSE)
+                   "rmarkdown", 
+                   "knitr"))
 BiocManager::install(c("apeglm"), ask = FALSE, update = FALSE)
 ```
 
@@ -50,8 +56,8 @@ save_plot <- function(p, name, height = 5) {
 }
 meta <- tibble(
   sample = c("srp_8_9_26", "dsRed_8_9_26", "srp_27_8_26", "dRed_27_8_26"),
-  condition = factor(c("control", "dsRed", "control", "dsRed"),
-                     levels = c("control", "dsRed")),
+  condition = factor(c("srp", "control", "srp", "control"),
+                     levels = c("control", "srp")),
   batch = factor(c("2026-09-08", "2026-09-08", "2026-08-27", "2026-08-27"))
 )
 
@@ -127,8 +133,8 @@ stopifnot(sum(keep) >= 2)
 cat("Retained", sum(keep), "of", nrow(cts), "genes.\n")
 dds <- DESeqDataSetFromMatrix(cts[keep, , drop = FALSE], coldata, design_formula)
 dds <- DESeq(dds)
-res <- results(dds, contrast = c("condition", "dsRed", "control"), alpha = alpha)
-shr <- lfcShrink(dds, coef = "condition_dsRed_vs_control", res = res, type = "apeglm")
+res <- results(dds, contrast = c("condition", "srp", "control"), alpha = alpha)
+shr <- lfcShrink(dds, coef = "condition_srp_vs_control", res = res, type = "apeglm")
 res_tbl <- as.data.frame(res) %>% rownames_to_column("gene_id") %>%
   mutate(log2FC_shrunken = shr$log2FoldChange,
          label = gene_id) %>% left_join(ann, by = "gene_id") %>%
@@ -250,7 +256,7 @@ tested genes when none is significant. Dashed fold-change lines are descriptive;
 the P values test a zero condition effect, not the dashed thresholds.
 
 ```{r DEG-plots}
-plotMA(shr, alpha = alpha, main = "MA: shrunken log2 fold changes")
+plotMA(shr, alpha = alpha, main = "MA: srp / dsRed control (shrunken log2FC)")
 pdf(file.path(out, "MA.pdf"), width = 7, height = 5)
 plotMA(shr, alpha = alpha)
 dev.off()
@@ -264,7 +270,7 @@ save_plot(ggplot(tested, aes(log2FC_shrunken, y, color = DEG)) +
   geom_hline(yintercept = -log10(alpha), linetype = 2) +
   geom_text_repel(data = labels, aes(label = label), seed = 42, max.overlaps = Inf,
                   size = 3) + scale_color_manual(values = c("grey65", "firebrick")) +
-  theme_bw() + labs(x = "Shrunken log2FC: dsRed / control", y = "-log10(adjusted P)",
+  theme_bw() + labs(x = "Shrunken log2FC: srp / dsRed control", y = "-log10(adjusted P)",
                     color = "FDR < 0.05"), "volcano", 6)
 save_plot(ggplot(res_tbl %>% dplyr::filter(baseMean > 0, is.finite(lfcSE)),
                  aes(baseMean, lfcSE, color = DEG)) + geom_point(alpha = 0.3) +
