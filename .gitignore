@@ -10,3 +10,5 @@
 *_files
 *_cache
 *.zip
+dataformat
+datasets

@@ -143,6 +143,32 @@ res_tbl <- as.data.frame(res) %>% rownames_to_column("gene_id") %>%
          DEG = !is.na(padj) & padj < alpha,
          large_effect_DEG = DEG & abs(log2FC_shrunken) >= lfc_cut) %>%
   arrange(padj, desc(abs(log2FC_shrunken)))
+
+ncbi_genes <- readr::read_tsv(
+  "../data/tribolium_ncbi_gene.tsv",
+  col_types = readr::cols(.default = readr::col_character()),
+  na = c("", "NA", "-")
+) %>%
+  dplyr::transmute(
+    ncbi_gene_id = `NCBI GeneID`,
+    ncbi_symbol = Symbol,
+    ncbi_description = Description
+  )
+
+# One row per GeneID so the join cannot duplicate DEG rows.
+stopifnot(!anyDuplicated(ncbi_genes$ncbi_gene_id))
+
+res_tbl <- res_tbl %>%
+  dplyr::mutate(ncbi_gene_id = sub("^LOC", "", as.character(gene_id))) %>%
+  dplyr::left_join(ncbi_genes, by = "ncbi_gene_id") %>%
+  dplyr::mutate(
+    display_label = dplyr::if_else(
+      is.na(ncbi_description),
+      label,
+      paste0(ncbi_description, " [", ncbi_gene_id, "]")
+    )
+  )
+
 write_csv(res_tbl, file.path(out, "DESeq2_all_tested_genes.csv"))
 write_csv(dplyr::filter(res_tbl, DEG), file.path(out, "DESeq2_FDR05.csv"))
 write_csv(dplyr::filter(res_tbl, large_effect_DEG), file.path(out, "DESeq2_FDR05_LFC1.csv"))
@@ -186,34 +212,24 @@ pheatmap(dist_mat, cluster_rows = hc, cluster_cols = hc, annotation_col = annota
          annotation_row = annotation, filename = file.path(out, "sample_distances.pdf"))
 ```
 
-## Most variable genes and good p_adj DEGs
+## Most variable genes and top DEGs
 
 ```{r most-variable, fig.width=10, fig.height=8, fig.keep='all'}
 v <- apply(assay(rld), 1, var)
 top_var <- head(names(sort(v[v > 0], decreasing = TRUE)), 30)
+heatmap_display <- NULL
+
 if (length(top_var) >= 2) {
   heat_mat <- assay(rld)[top_var, , drop = FALSE]
 
-  # Match gene names to matrix rows by gene ID.
-  gene_labels <- as.character(ann$gene_name[
-    match(rownames(heat_mat), as.character(ann$gene_id))
-  ])
-  gene_labels <- trimws(gene_labels)
+  ids <- rownames(heat_mat)
+  gene_labels <- trimws(as.character(res_tbl$display_label[
+    match(ids, as.character(res_tbl$gene_id))
+  ]))
+  missing_label <- is.na(gene_labels) | gene_labels %in% c("", "-", "NA")
+  gene_labels[missing_label] <- ids[missing_label]
 
-  # Fall back to gene IDs when names are missing.
-  missing_name <- is.na(gene_labels) |
-    gene_labels %in% c("", "-", "NA")
-  gene_labels[missing_name] <- rownames(heat_mat)[missing_name]
-
-  # Distinguish genes that share a name.
-  duplicate_name <- duplicated(gene_labels) |
-    duplicated(gene_labels, fromLast = TRUE)
-  gene_labels[duplicate_name] <- paste0(
-    gene_labels[duplicate_name], " [",
-    rownames(heat_mat)[duplicate_name], "]"
-  )
-
-  h <- pheatmap(
+  h <- pheatmap::pheatmap(
     heat_mat,
     scale = "row",
     annotation_col = annotation,
@@ -226,34 +242,25 @@ if (length(top_var) >= 2) {
     silent = TRUE
   )
 
-
-
-# Save PDF.
-  pdf(file.path(out, "variable_genes_heatmap.pdf"),
-      width = 10, height = 8)
+  pdf(file.path(out, "variable_genes_heatmap.pdf"), width = 10, height = 8)
   grid::grid.newpage()
   grid::grid.draw(h$gtable)
   invisible(dev.off())
 
-  # Save PNG for embedding in the knitted document.
   heatmap_png <- file.path(out, "variable_genes_heatmap.png")
   png(heatmap_png, width = 2000, height = 1600, res = 200)
   grid::grid.newpage()
   grid::grid.draw(h$gtable)
   invisible(dev.off())
 
-  heatmap_display <- knitr::include_graphics(
-    normalizePath(heatmap_png)
-  )
+  heatmap_display <- knitr::include_graphics(normalizePath(heatmap_png))
 } else {
-  heatmap_display <- NULL
   cat("Too few variable genes to draw a heatmap.\n")
 }
 
-# This must be outside the if block, inside the R chunk.
+# Keep outside the if/else so knitr renders the image.
 heatmap_display
 ```
-
 
 ```{r top-DEG-heatmap, fig.width=10, fig.height=8}
 top_degs <- res_tbl %>%
@@ -264,20 +271,14 @@ top_degs <- res_tbl %>%
 deg_heatmap_display <- NULL
 
 if (nrow(top_degs) > 0) {
-  deg_mat <- assay(rld)[top_degs$gene_id, , drop = FALSE]
+  deg_mat <- assay(rld)[as.character(top_degs$gene_id), , drop = FALSE]
 
-  # Gene-name labels in the same order as the matrix rows.
-  gene_labels <- trimws(as.character(top_degs$gene_name))
-  missing_name <- is.na(gene_labels) |
-    gene_labels %in% c("", "-", "NA")
-  gene_labels[missing_name] <- top_degs$gene_id[missing_name]
-
-  duplicate_name <- duplicated(gene_labels) |
-    duplicated(gene_labels, fromLast = TRUE)
-  gene_labels[duplicate_name] <- paste0(
-    gene_labels[duplicate_name], " [",
-    top_degs$gene_id[duplicate_name], "]"
-  )
+  ids <- rownames(deg_mat)
+  gene_labels <- trimws(as.character(top_degs$display_label[
+    match(ids, as.character(top_degs$gene_id))
+  ]))
+  missing_label <- is.na(gene_labels) | gene_labels %in% c("", "-", "NA")
+  gene_labels[missing_label] <- ids[missing_label]
 
   deg_annotation <- coldata[
     colnames(deg_mat), c("condition", "batch"), drop = FALSE
@@ -300,28 +301,23 @@ if (nrow(top_degs) > 0) {
     silent = TRUE
   )
 
-  # Save PDF.
-  pdf(file.path(out, "top30_DEGs_heatmap.pdf"),
-      width = 10, height = 8)
+  pdf(file.path(out, "top30_DEGs_heatmap.pdf"), width = 10, height = 8)
   grid::grid.newpage()
   grid::grid.draw(deg_h$gtable)
   invisible(dev.off())
 
-  # Save PNG for the knitted document.
   deg_png <- file.path(out, "top30_DEGs_heatmap.png")
   png(deg_png, width = 2000, height = 1600, res = 200)
   grid::grid.newpage()
   grid::grid.draw(deg_h$gtable)
   invisible(dev.off())
 
-  deg_heatmap_display <- knitr::include_graphics(
-    normalizePath(deg_png)
-  )
+  deg_heatmap_display <- knitr::include_graphics(normalizePath(deg_png))
 } else {
   cat("No genes pass the adjusted P-value threshold; no DEG heatmap drawn.\n")
 }
 
-# Outside the if/else block so knitr renders the image.
+# Keep outside the if/else so knitr renders the image.
 deg_heatmap_display
 ```
 
