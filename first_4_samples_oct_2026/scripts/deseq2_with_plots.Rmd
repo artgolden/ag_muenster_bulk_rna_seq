@@ -331,23 +331,43 @@ the P values test a zero condition effect, not the dashed thresholds.
 plotMA(shr, alpha = alpha, main = "MA: srp / dsRed control (shrunken log2FC)")
 pdf(file.path(out, "MA.pdf"), width = 7, height = 5)
 plotMA(shr, alpha = alpha)
-dev.off()
-tested <- res_tbl %>% dplyr::filter(!is.na(padj), is.finite(log2FC_shrunken)) %>%
-  mutate(y = -log10(pmax(padj, .Machine$double.xmin)))
+invisible(dev.off())
+
+tested <- res_tbl %>%
+  dplyr::filter(!is.na(padj), is.finite(log2FC_shrunken)) %>%
+  dplyr::mutate(
+    y = -log10(pmax(padj, .Machine$double.xmin)),
+    display_label = trimws(as.character(display_label)),
+    display_label = dplyr::if_else(
+      is.na(display_label) | display_label %in% c("", "-", "NA"),
+      as.character(gene_id),
+      display_label
+    )
+  )
+
 labels <- tested %>% dplyr::filter(DEG) %>% head(10)
 if (nrow(labels) == 0) labels <- head(tested, 10)
+
 save_plot(ggplot(tested, aes(log2FC_shrunken, y, color = DEG)) +
   geom_point(alpha = 0.5, size = 1.2) +
   geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = 2) +
   geom_hline(yintercept = -log10(alpha), linetype = 2) +
-  geom_text_repel(data = labels, aes(label = label), seed = 42, max.overlaps = Inf,
-                  size = 3) + scale_color_manual(values = c("grey65", "firebrick")) +
-  theme_bw() + labs(x = "Shrunken log2FC: srp / dsRed control", y = "-log10(adjusted P)",
-                    color = "FDR < 0.05"), "volcano", 6)
+  geom_text_repel(
+    data = labels, aes(label = display_label),
+    seed = 42, max.overlaps = Inf, size = 3
+  ) +
+  scale_color_manual(values = c("grey65", "firebrick")) +
+  theme_bw() +
+  labs(x = "Shrunken log2FC: srp / dsRed control", y = "-log10(adjusted P)",
+       color = paste("FDR <", alpha)), "volcano", 6)
+
 save_plot(ggplot(res_tbl %>% dplyr::filter(baseMean > 0, is.finite(lfcSE)),
-                 aes(baseMean, lfcSE, color = DEG)) + geom_point(alpha = 0.3) +
+                 aes(baseMean, lfcSE, color = DEG)) +
+  geom_point(alpha = 0.3) +
   scale_x_log10() + theme_bw() +
-  labs(x = "Mean normalized count", y = "Unshrunken log2FC standard error"), "LFC_uncertainty")
+  labs(x = "Mean normalized count", y = "Unshrunken log2FC standard error"),
+  "LFC_uncertainty")
+
 save_plot(ggplot(res_tbl %>% dplyr::filter(!is.na(pvalue)), aes(pvalue)) +
   geom_histogram(bins = 40) + theme_bw(), "pvalue_histogram")
 ```
@@ -362,22 +382,34 @@ automatically exclude samples or genes based on this plot.
 
 ```{r individual-plots}
 if (nrow(labels) > 0) {
-  top_counts <- as.data.frame(norm[head(labels$gene_id, 6), , drop = FALSE]) %>%
-    rownames_to_column("gene_id") %>% pivot_longer(-gene_id, names_to = "sample",
-                                                  values_to = "count") %>%
+  count_labels <- labels %>%
+    head(6) %>%
+    dplyr::transmute(gene_id = as.character(gene_id), display_label)
+
+  top_counts <- as.data.frame(norm[count_labels$gene_id, , drop = FALSE]) %>%
+    rownames_to_column("gene_id") %>%
+    pivot_longer(-gene_id, names_to = "sample", values_to = "count") %>%
     left_join(meta, by = "sample") %>%
-    left_join(res_tbl %>% dplyr::select(gene_id, label), by = "gene_id")
+    left_join(count_labels, by = "gene_id")
+
   save_plot(ggplot(top_counts, aes(condition, count + 0.5, color = batch)) +
-    geom_point(position = position_jitter(width = 0.1, height = 0, seed = 42), size = 3) +
-    scale_y_log10() + facet_wrap(~ label, scales = "free_y") + theme_bw() +
+    geom_point(position = position_jitter(width = 0.1, height = 0, seed = 42),
+               size = 3) +
+    scale_y_log10() +
+    facet_wrap(~ display_label, scales = "free_y", labeller = label_wrap_gen(30)) +
+    theme_bw() +
     labs(y = "Normalized count + 0.5"), "top_gene_counts", 7)
 }
+
 cooks <- as.data.frame(assays(dds)[["cooks"]]) %>%
   pivot_longer(everything(), names_to = "sample", values_to = "cooks")
+
 save_plot(ggplot(cooks %>% dplyr::filter(is.finite(cooks)),
-                 aes(sample, log10(cooks + 1))) + geom_boxplot(outlier.shape = NA) +
+                 aes(sample, log10(cooks + 1))) +
+  geom_boxplot(outlier.shape = NA) +
   theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
   labs(y = "log10(Cook's distance + 1)"), "Cooks_distances")
+
 saveRDS(list(dds = dds, rlog = rld, results = res_tbl, metadata = meta),
         file.path(out, "DESeq2_analysis.rds"))
 writeLines(capture.output(sessionInfo()), file.path(out, "sessionInfo.txt"))
